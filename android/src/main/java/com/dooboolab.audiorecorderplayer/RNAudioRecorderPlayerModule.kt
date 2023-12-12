@@ -1,11 +1,16 @@
 package com.dooboolab.audiorecorderplayer
 
+import PcmToWavUtil
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -14,9 +19,17 @@ import androidx.core.app.ActivityCompat
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter
 import com.facebook.react.modules.core.PermissionListener
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileNotFoundException
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.*
-import kotlin.math.log10
+
 
 class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext), PermissionListener {
     private var audioFileURL = ""
@@ -29,11 +42,23 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
     private var mTimer: Timer? = null
     private var pausedRecordTime = 0L
     private var totalPausedRecordTime = 0L
+
+    private var audioRecorder:AudioRecord? = null;
+    private var pcmFilePath:String? = null;
+    private var isRecording = false;
+
+
+    private var sampleRateInHz:Int = 44100;
+    private var channelConfig:Int = AudioFormat.CHANNEL_IN_STEREO;
+    private var audioFormat:Int = AudioFormat.ENCODING_PCM_16BIT;
+
     var recordHandler: Handler? = Handler(Looper.getMainLooper())
+
     override fun getName(): String {
         return tag
     }
 
+    @SuppressLint("SuspiciousIndentation")
     @ReactMethod
     fun startRecorder(path: String, audioSet: ReadableMap?, meteringEnabled: Boolean, promise: Promise) {
         try {
@@ -60,57 +85,96 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
             promise.reject("No permission granted.", "Try again after adding permission.")
             return
         }
+
         audioFileURL = if (((path == "DEFAULT"))) "${reactContext.cacheDir}/$defaultFileName" else path
         _meteringEnabled = meteringEnabled
 
-        if (mediaRecorder == null) {
-            mediaRecorder = MediaRecorder()
+        //音频音率
+        sampleRateInHz = if (audioSet?.hasKey("AudioSamplingRateAndroid") == true) {
+            audioSet.getInt("AudioSamplingRateAndroid")
+        } else {
+            44100
         }
 
-        if (audioSet != null) {
-            mediaRecorder!!.setAudioSource(if (audioSet.hasKey("AudioSourceAndroid")) audioSet.getInt("AudioSourceAndroid") else MediaRecorder.AudioSource.MIC)
-            mediaRecorder!!.setOutputFormat(if (audioSet.hasKey("OutputFormatAndroid")) audioSet.getInt("OutputFormatAndroid") else MediaRecorder.OutputFormat.MPEG_4)
-            mediaRecorder!!.setAudioEncoder(if (audioSet.hasKey("AudioEncoderAndroid")) audioSet.getInt("AudioEncoderAndroid") else MediaRecorder.AudioEncoder.AAC)
-            mediaRecorder!!.setAudioSamplingRate(if (audioSet.hasKey("AudioSamplingRateAndroid")) audioSet.getInt("AudioSamplingRateAndroid") else 48000)
-            mediaRecorder!!.setAudioEncodingBitRate(if (audioSet.hasKey("AudioEncodingBitRateAndroid")) audioSet.getInt("AudioEncodingBitRateAndroid") else 128000)
-            mediaRecorder!!.setAudioChannels(if (audioSet.hasKey("AudioChannelsAndroid")) audioSet.getInt("AudioChannelsAndroid") else 2)
+        //音频音源
+        var audioSource = if (audioSet?.hasKey("AudioSourceAndroid") == true) {
+            audioSet.getInt("AudioSourceAndroid")
         } else {
-            mediaRecorder!!.setAudioSource(MediaRecorder.AudioSource.MIC)
-            mediaRecorder!!.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            mediaRecorder!!.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            mediaRecorder!!.setAudioEncodingBitRate(128000)
-            mediaRecorder!!.setAudioSamplingRate(48000)
+            MediaRecorder.AudioSource.MIC
         }
-        mediaRecorder!!.setOutputFile(audioFileURL)
+
+        //通道
+        channelConfig = if (audioSet?.hasKey("AudioChannelsAndroid") == true) {
+            audioSet.getInt("AudioChannelsAndroid")
+        } else {
+            AudioFormat.CHANNEL_IN_STEREO //双通道
+        }
+
+        //音频精度
+        audioFormat = if (audioSet?.hasKey("OutputFormatAndroid") == true) {
+            audioSet.getInt("OutputFormatAndroid")
+        } else {
+            AudioFormat.ENCODING_PCM_16BIT
+        }
+
+        var bufferSize = AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat);
+
+        if (audioRecorder == null) {
+            audioRecorder = AudioRecord(audioSource,sampleRateInHz, channelConfig,audioFormat,bufferSize);
+        }
+        pcmFilePath = path.replace("86jun_record.wav", "86jun_record.pcm");
+
+        var pcmFile = File(pcmFilePath)
+
+        if (pcmFile.exists()){
+            pcmFile.delete()
+        }
 
         try {
-            mediaRecorder!!.prepare()
+            isRecording = true;
             totalPausedRecordTime = 0L
-            mediaRecorder!!.start()
+            audioRecorder!!.startRecording()
+
             val systemTime = SystemClock.elapsedRealtime()
+
             recorderRunnable = object : Runnable {
                 override fun run() {
+
                     val time = SystemClock.elapsedRealtime() - systemTime - totalPausedRecordTime
                     val obj = Arguments.createMap()
                     obj.putDouble("currentPosition", time.toDouble())
-                    if (_meteringEnabled) {
-                        var maxAmplitude = 0
-                        if (mediaRecorder != null) {
-                            maxAmplitude = mediaRecorder!!.maxAmplitude
-                        }
-                        var dB = -160.0
-                        val maxAudioSize = 32767.0
-                        if (maxAmplitude > 0) {
-                            dB = 20 * log10(maxAmplitude / maxAudioSize)
-                        }
-                        obj.putInt("currentMetering", dB.toInt())
-                    }
                     sendEvent(reactContext, "rn-recordback", obj)
                     recordHandler!!.postDelayed(this, subsDurationMillis.toLong())
                 }
             }
+
             (recorderRunnable as Runnable).run()
             promise.resolve("file:///$audioFileURL")
+
+
+            var audioThread = Thread {
+
+                val buffer = ByteArray(bufferSize)
+
+                var  fileOutputStream:FileOutputStream? = null;
+
+                try {
+                    fileOutputStream = FileOutputStream(pcmFile)
+
+                    if (fileOutputStream != null) {
+                        while (isRecording) {
+                            var readStatus = audioRecorder!!.read(buffer, 0,bufferSize);
+//                                Log.i("AudioChannel", "len: $readStatus");
+                            fileOutputStream.write(buffer);
+                        }
+                    }
+                } finally {
+                    fileOutputStream?.close()
+                }
+            }.apply {
+                name = "RecordingThread"
+            }
+            audioThread.start()
         } catch (e: Exception) {
             Log.e(tag, "Exception: ", e)
             promise.reject("startRecord", e.message)
@@ -119,13 +183,13 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
 
     @ReactMethod
     fun resumeRecorder(promise: Promise) {
-        if (mediaRecorder == null) {
+        if (audioRecorder == null) {
             promise.reject("resumeReocrder", "Recorder is null.")
             return
         }
-
+        isRecording = true;
         try {
-            mediaRecorder!!.resume()
+            audioRecorder!!.startRecording()
             totalPausedRecordTime += SystemClock.elapsedRealtime() - pausedRecordTime;
             recorderRunnable?.let { recordHandler!!.postDelayed(it, subsDurationMillis.toLong()) }
             promise.resolve("Recorder resumed.")
@@ -137,13 +201,13 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
 
     @ReactMethod
     fun pauseRecorder(promise: Promise) {
-        if (mediaRecorder == null) {
+        if (audioRecorder == null) {
             promise.reject("pauseRecorder", "Recorder is null.")
             return
         }
-
+        isRecording =false;
         try {
-            mediaRecorder!!.pause()
+            audioRecorder!!.stop()
             pausedRecordTime = SystemClock.elapsedRealtime();
             recorderRunnable?.let { recordHandler!!.removeCallbacks(it) };
             promise.resolve("Recorder paused.")
@@ -159,16 +223,34 @@ class RNAudioRecorderPlayerModule(private val reactContext: ReactApplicationCont
             recorderRunnable?.let { recordHandler!!.removeCallbacks(it) }
         }
 
-        if (mediaRecorder == null) {
+        if (audioRecorder == null) {
             promise.reject("stopRecord", "recorder is null.")
             return
         }
-
+        isRecording = false;
         try {
-            mediaRecorder!!.stop()
-            mediaRecorder!!.reset()
-            mediaRecorder!!.release()
-            mediaRecorder = null
+            audioRecorder!!.stop()
+            audioRecorder!!.release()
+            audioRecorder = null
+
+            var pcmfile = File(this.pcmFilePath);
+
+            if (pcmfile.exists()) {
+                Log.i("audioFileURL","文件存在" + pcmfile.length());
+            }
+
+            PcmToWavUtil(this.sampleRateInHz,this.channelConfig,if (this.channelConfig == AudioFormat.CHANNEL_IN_STEREO) {
+                2
+            } else {
+                1
+            },this.audioFormat).pcmToWav(this.pcmFilePath,this.audioFileURL)
+
+            var file = File(this.audioFileURL);
+
+            if (file.exists()) {
+                Log.i("audioFileURL","文件存在" + file.length());
+            }
+
             promise.resolve("file:///$audioFileURL")
         } catch (stopException: RuntimeException) {
             stopException.message?.let { Log.d(tag,"" + it) }
